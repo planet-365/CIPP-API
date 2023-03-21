@@ -41,8 +41,7 @@ function Get-GraphToken($tenantid, $scope, $AsApp, $AppID, $refreshToken, $Retur
         client_secret = $env:ApplicationSecret
         scope         = $Scope
         refresh_token = $env:RefreshToken
-        grant_type    = 'refresh_token'
-                    
+        grant_type    = 'refresh_token'             
     }
     if ($asApp -eq $true) {
         $AuthBody = @{
@@ -68,6 +67,7 @@ function Get-GraphToken($tenantid, $scope, $AsApp, $AppID, $refreshToken, $Retur
         $AccessToken = (Invoke-RestMethod -Method post -Uri "https://login.microsoftonline.com/$($tenantid)/oauth2/v2.0/token" -Body $Authbody -ErrorAction Stop)
         if ($ReturnRefresh) { $header = $AccessToken } else { $header = @{ Authorization = "Bearer $($AccessToken.access_token)" } }
         return $header
+        Write-Host $header['Authorization']
     }
     catch {
         # Track consecutive Graph API failures
@@ -136,7 +136,8 @@ function New-GraphGetRequest {
     ) 
 
     if ($scope -eq 'ExchangeOnline') { 
-        $Headers = Get-GraphToken -AppID 'a0c73c16-a7e3-4564-9a95-2bdf47383716' -RefreshToken $env:ExchangeRefreshToken -Scope 'https://outlook.office365.com/.default' -Tenantid $tenantid
+        $AccessToken = Get-ClassicAPIToken -resource 'https://outlook.office365.com' -Tenantid $tenantid
+        $headers = @{ Authorization = "Bearer $($AccessToken.access_token)" }
     }
     else {
         $headers = Get-GraphToken -tenantid $tenantid -scope $scope -AsApp $asapp
@@ -220,8 +221,16 @@ function convert-skuname($skuname, $skuID) {
 }
 
 function Get-ClassicAPIToken($tenantID, $Resource) {
+    Write-Host "Using classic"
     $uri = "https://login.microsoftonline.com/$($TenantID)/oauth2/token"
-    $body = "resource=$Resource&grant_type=refresh_token&refresh_token=$($env:ExchangeRefreshToken)"
+    $Body = @{
+        client_id     = $env:ApplicationID
+        client_secret = $env:ApplicationSecret
+        resource      = $Resource
+        refresh_token = $env:RefreshToken
+        grant_type    = 'refresh_token'
+                    
+    }
 
     try {
         $token = Invoke-RestMethod $uri -Body $body -ContentType 'application/x-www-form-urlencoded' -ErrorAction SilentlyContinue -Method post
@@ -315,11 +324,13 @@ function New-ClassicAPIPostRequest($TenantID, $Uri, $Method = 'POST', $Resource 
     if ((Get-AuthorisedRequest -Uri $uri -TenantID $tenantid)) {
         try {
             $ReturnedData = Invoke-RestMethod -ContentType 'application/json;charset=UTF-8' -Uri $Uri -Method $Method -Body $Body -Headers @{
-                Authorization            = "Bearer $($token.access_token)";
-                'x-ms-client-request-id' = [guid]::NewGuid().ToString();
-                'x-ms-client-session-id' = [guid]::NewGuid().ToString()
-                'x-ms-correlation-id'    = [guid]::NewGuid()
-                'X-Requested-With'       = 'XMLHttpRequest' 
+                Authorization                  = "Bearer $($token.access_token)";
+                'x-ms-client-request-id'       = [guid]::NewGuid().ToString();
+                'x-ms-client-session-id'       = [guid]::NewGuid().ToString()
+                'x-ms-correlation-id'          = [guid]::NewGuid()
+                'X-Requested-With'             = 'XMLHttpRequest' 
+                'X-RequestForceAuthentication' = $true
+
             } 
                        
         }
@@ -356,25 +367,28 @@ function Get-Tenants {
     )
 
     $TenantsTable = Get-CippTable -tablename 'Tenants'
-    # We create the excluded tenants file. This is not set to force so will not overwrite
-
-    if ($IncludeErrors) {
-        $ExcludedFilter = "PartitionKey eq 'Tenants' and Excluded eq true" 
-    }
-    else {
-        $ExcludedFilter = "PartitionKey eq 'Tenants' and (Excluded eq true or GraphErrorCount gt 50)" 
-    }
+    $ExcludedFilter = "PartitionKey eq 'Tenants' and Excluded eq true" 
+ 
     $SkipListCache = Get-AzDataTableRow @TenantsTable -Filter $ExcludedFilter
         
-    # Load or refresh the cache if older than 24 hours
-    $Filter = "PartitionKey eq 'Tenants' and Excluded eq false" 
+    if ($IncludeAll) {
+        $Filter = "PartitionKey eq 'Tenants'" 
+    }
+    else {
+        $Filter = "PartitionKey eq 'Tenants' and Excluded eq false" 
+
+    }
     $IncludedTenantsCache = Get-AzDataTableEntity @TenantsTable -Filter $Filter
-        
+
     $LastRefresh = ($IncludedTenantsCache | Sort-Object LastRefresh | Select-Object -First 1).LastRefresh.DateTime
+
     if ($LastRefresh -lt (Get-Date).Addhours(-24).ToUniversalTime()) {
-
-        $TenantList = (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/contracts?`$top=999" -tenantid $env:TenantID ) | Select-Object id, customerId, DefaultdomainName, DisplayName, domains | Where-Object -Property defaultDomainName -NotIn $SkipListCache.defaultDomainName
-
+        try {
+            $TenantList = (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/managedTenants/tenants?`$top=999" -tenantid $env:TenantID ) | Select-Object id, @{l = 'customerId'; e = { $_.tenantId } }, @{l = 'DefaultdomainName'; e = { [string]($_.contract.defaultDomainName) } } , @{l = 'MigratedToNewTenantAPI'; e = { $true } }, DisplayName, domains, tenantStatusInformation | Where-Object -Property defaultDomainName -NotIn $SkipListCache.defaultDomainName, 'Invalid'
+        }
+        catch {
+            $TenantList = (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/contracts?`$top=999" -tenantid $env:TenantID ) | Select-Object id, customerId, DefaultdomainName, DisplayName, domains, @{l = 'MigratedToNewTenantAPI'; e = { $false } } | Where-Object -Property defaultDomainName -NotIn $SkipListCache.defaultDomainName
+        }
         $IncludedTenantsCache = [system.collections.generic.list[hashtable]]::new()
         if ($env:PartnerTenantAvailable) {
             $IncludedTenantsCache.Add(@{
@@ -394,18 +408,20 @@ function Get-Tenants {
         }
         foreach ($Tenant in $TenantList) {
             $IncludedTenantsCache.Add(@{
-                    RowKey            = $Tenant.id
-                    PartitionKey      = 'Tenants'
-                    customerId        = $Tenant.customerId
-                    defaultDomainName = $Tenant.defaultDomainName
-                    displayName       = $Tenant.DisplayName
-                    domains           = ''
-                    Excluded          = $false
-                    ExcludeUser       = ''
-                    ExcludeDate       = ''
-                    GraphErrorCount   = 0
-                    LastGraphError    = ''
-                    LastRefresh       = (Get-Date).ToUniversalTime()
+                    RowKey                   = [string]$Tenant.customerId
+                    PartitionKey             = 'Tenants'
+                    customerId               = [string]$Tenant.customerId
+                    defaultDomainName        = [string]$Tenant.defaultDomainName
+                    displayName              = [string]$Tenant.DisplayName
+                    delegatedPrivilegeStatus = [string]$Tenant.tenantStatusInformation.delegatedPrivilegeStatus
+                    domains                  = ''
+                    Excluded                 = $false
+                    ExcludeUser              = ''
+                    ExcludeDate              = ''
+                    GraphErrorCount          = 0
+                    LastGraphError           = ''
+                    LastRefresh              = (Get-Date).ToUniversalTime()
+                    MigratedToNewTenantAPI   = [string]$Tenant.MigratedToNewTenantAPI
                 }) | Out-Null
         }
    
@@ -417,13 +433,12 @@ function Get-Tenants {
     if ($SkipList) {
         return $SkipListCache
     }
-
-    if ($IncludeAll) {
-        return (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/contracts?`$top=999" -tenantid $env:TenantID) | Select-Object CustomerId, DefaultdomainName, DisplayName, domains
-    }
-    else {
-        return ($IncludedTenantsCache | Sort-Object -Property displayName)
-    }
+    $NewTenantAPI = ($IncludedTenantsCache | Sort-Object LastRefresh | Select-Object -First 1).MigratedToNewTenantAPI
+    if (!$NewTenantAPI) {
+        Remove-CIPPCache -tenantsOnly $true
+    }  
+    return ($IncludedTenantsCache | Sort-Object -Property displayName)
+  
 }
 
 function Remove-CIPPCache {
@@ -456,7 +471,7 @@ function Remove-CIPPCache {
     }
 }
 
-function New-ExoRequest ($tenantid, $cmdlet, $cmdParams) {
+function New-ExoRequest ($tenantid, $cmdlet, $cmdParams, $useSystemMailbox, $Anchor) {
     $token = Get-ClassicAPIToken -resource 'https://outlook.office365.com' -Tenantid $tenantid 
     if ((Get-AuthorisedRequest -TenantID $tenantid)) {
         $tenant = (get-tenants | Where-Object -Property defaultDomainName -EQ $tenantid).customerId
@@ -472,10 +487,22 @@ function New-ExoRequest ($tenantid, $cmdlet, $cmdParams) {
                 Parameters = $Params
             }
         } 
-        $OnMicrosoft = (New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/domains?$top=999' -tenantid $tenantid | Where-Object -Property isInitial -EQ $true).id
+        if (!$Anchor) {
+            if ($cmdparams.Identity) { $Anchor = $cmdparams.Identity } 
+            if ($cmdparams.anr) { $Anchor = $cmdparams.anr } 
+            if ($cmdparams.User) { $Anchor = $cmdparams.User } 
+        
+            if (!$Anchor -or $useSystemMailbox) {
+                $OnMicrosoft = (New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/domains?$top=999' -tenantid $tenantid | Where-Object -Property isInitial -EQ $true).id
+                $anchor = "UPN:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@$($OnMicrosoft)"
+            
+            }
+        }
+        Write-Host "Using $Anchor"
         $Headers = @{ 
             Authorization     = "Bearer $($token.access_token)" 
-            'X-AnchorMailbox' = "UPN:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@$($OnMicrosoft)"
+            Prefer            = "odata.maxpagesize = 1000"
+            'X-AnchorMailbox' = $anchor
 
         }
         try {
@@ -615,3 +642,19 @@ function New-DeviceLogin {
     return $ReturnCode
 }
 
+function New-passwordString {
+    [CmdletBinding()]
+    param (
+        [int]$count = 12
+    )
+    Set-Location (Get-Item $PSScriptRoot).FullName
+    $SettingsTable = Get-CippTable -tablename 'Settings'
+    $PasswordType = (Get-AzDataTableRow @SettingsTable).passwordType
+    if ($PasswordType -eq "Correct-Battery-Horse") { 
+        $Words = Get-Content .\words.txt
+        (Get-Random -InputObject $words -Count 4) -join '-'
+    }
+    else {
+        -join ('abcdefghkmnrstuvwxyzABCDEFGHKLMNPRSTUVWXYZ23456789$%&*#'.ToCharArray() | Get-Random -Count $count)
+    }
+}
