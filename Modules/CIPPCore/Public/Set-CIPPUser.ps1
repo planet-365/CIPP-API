@@ -149,6 +149,7 @@ function Set-CIPPUser {
                         Webhook = [bool]$UserObj.PostExecution.webhook
                         Email   = [bool]$UserObj.PostExecution.email
                         PSA     = [bool]$UserObj.PostExecution.psa
+                        Push    = [bool]$UserObj.PostExecution.push
                     }
                 }
                 Add-CIPPScheduledTask -Task $taskObject -hidden $false -Headers $Headers
@@ -241,7 +242,7 @@ function Set-CIPPUser {
                 else { 'Security' }
             }
         } catch {
-            Write-LogMessage -headers $Headers -API $APIName -tenant $UserObj.tenantFilter -Sev 'Warn' -message "Could not look up group types, falling back to the types supplied by the request: $($_.Exception.Message)"
+            Write-LogMessage -headers $Headers -API $APIName -tenant $UserObj.tenantFilter -Sev 'Warning' -message "Could not look up group types, falling back to the types supplied by the request: $($_.Exception.Message)"
         }
     }
 

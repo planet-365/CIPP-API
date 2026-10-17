@@ -27,7 +27,8 @@ BeforeAll {
 
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Get-CIPPIntuneCompareExclusions.ps1')
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Compare-CIPPIntuneObject.ps1')
-    . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines/Invoke-CIPPBaselineStandard.ps1')
+    . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/Helpers/Get-CIPPBaselineCommand.ps1')
+    . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/Helpers/Invoke-CIPPBaselineStandard.ps1')
     . (Join-Path $script:RepoRoot 'Modules/CIPPActivityTriggers/Public/Entrypoints/Activity Triggers/Baselines/Push-CIPPBaselineStandard.ps1')
 
     $script:Tenant = 'contoso.onmicrosoft.com'
@@ -151,7 +152,7 @@ Describe 'Invoke-CIPPBaselineStandard render option-unwrap' {
 
 Describe 'Invoke-CIPPBaselineGraphBulkSweep batch ids' {
     BeforeAll {
-        . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines/Invoke-CIPPBaselineGraphBulkSweep.ps1')
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/Executors/Invoke-CIPPBaselineGraphBulkSweep.ps1')
         function New-GraphBulkRequest { param($tenantid, $Requests, $scope, $asapp, $Version) }
     }
 
@@ -196,7 +197,7 @@ Describe 'Get-CIPPBaselineDisableInactiveUsersState exclusions' {
         function Get-CIPPBaselineCacheRows { param($TenantFilter, $Type, $CollectorType, $CollectorArgs) }
         function Test-CIPPBaselineCacheCollected { param($TenantFilter, $Type) $true }
         function New-GraphGetRequest { param($uri, $tenantid, $AsApp, $scope) }
-        . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines/Get-CIPPBaselineDisableInactiveUsersState.ps1')
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/PrepareHooks/Get-CIPPBaselineDisableInactiveUsersState.ps1')
     }
 
     It 'excluded accounts are never offenders - a breakglass account must not be sweep-disabled' {
@@ -216,7 +217,7 @@ Describe 'Get-CIPPBaselineDisableInactiveUsersState exclusions' {
 Describe 'Invoke-CIPPBaselineExoPolicyRule extraPolicyParams' {
     BeforeAll {
         function New-ExoRequest { param($tenantid, $cmdlet, $cmdParams, $useSystemMailbox) }
-        . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines/Invoke-CIPPBaselineExoPolicyRule.ps1')
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/Executors/Invoke-CIPPBaselineExoPolicyRule.ps1')
     }
 
     It 'merges hook-derived policy params over the rendered spec - grade and write share one derivation' {
@@ -245,7 +246,7 @@ Describe 'Invoke-CIPPBaselineEnableFIDO2 passkey profile normalization' {
     BeforeAll {
         function New-GraphGetRequest { param($uri, $tenantid, $AsApp) }
         function New-GraphPostRequest { param($uri, $tenantid, $type, $body, $AsApp, $ContentType) }
-        . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines/Invoke-CIPPBaselineEnableFIDO2.ps1')
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/Executors/Invoke-CIPPBaselineEnableFIDO2.ps1')
     }
 
     It 'gives profiles missing keyRestrictions the neutral shape before the PATCH - Graph validates the whole config' {
@@ -315,7 +316,7 @@ Describe 'Get-CIPPBaselineDetectCADriftState SharePoint side-effect policies' {
     BeforeAll {
         function Get-CIPPDbItem { param($TenantFilter, $Type, [switch]$CountsOnly) }
         function Get-CIPPBaselineWorkItems { param($TenantFilter) }
-        . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines/Get-CIPPBaselineDetectCADriftState.ps1')
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/PrepareHooks/Get-CIPPBaselineDetectCADriftState.ps1')
     }
     BeforeEach {
         Mock Get-CIPPAzDataTableEntity { @() }
@@ -511,5 +512,111 @@ Describe 'Compare-CIPPIntuneObject type tolerance' {
         $Dif = [PSCustomObject]@{ timeWindow = '60' }
         $Diff = @(Compare-CIPPIntuneObject -ReferenceObject $Ref -DifferenceObject $Dif | Where-Object { $_ })
         $Diff.Count | Should -Be 1
+    }
+}
+
+Describe 'Invoke-CIPPBaselineStandard remediation alerting and write failures' {
+    BeforeAll {
+        function Get-CippException { param($Exception) [PSCustomObject]@{ Message = "$($Exception.Exception.Message)"; RawError = 'body' } }
+        function Invoke-CIPPBaselineTestWrite { param($Remediate, $TenantFilter, $Current) }
+
+        # checkBeforeRun:false - the engine writes on EVERY run, compliant or not.
+        $script:WriteAlwaysDefinition = [PSCustomObject]@{
+            name                 = 'WriteAlways'; label = 'Write Always Standard'
+            requiredCapabilities = @(); variables = [PSCustomObject]@{}
+            checkBeforeRun       = $false
+            read                 = [PSCustomObject]@{ cacheType = 'TestCache' }
+            expected             = [PSCustomObject]@{ enabled = $true }
+            remediate            = [PSCustomObject]@{ executor = 'TestWrite' }
+        }
+        $script:WriteAlwaysItem = @{
+            TenantFilter = $script:Tenant; Standard = 'WriteAlways'; BaseName = 'WriteAlways'
+            Variables = [PSCustomObject]@{}; Tiers = @()
+            AlertEnabled = $true; AlertOnRemediate = $true; RemediateEnabled = $true
+        }
+        $script:PriorRow = {
+            param($Status)
+            [PSCustomObject]@{ PartitionKey = $script:Tenant; RowKey = 'WriteAlways'; StandardName = 'WriteAlways'; Status = $Status; LastRun = 1 }
+        }
+    }
+
+    BeforeEach {
+        $script:Persisted = $null
+        Mock Get-CIPPBaselineDefinition { $script:WriteAlwaysDefinition }
+        Mock New-CIPPDbRequest { [PSCustomObject]@{ enabled = $true } }
+        Mock Invoke-CIPPBaselineTestWrite { }
+        Mock Set-CIPPBaselineResult { $script:Persisted = $Result }
+        Mock Add-CIPPBaselineHistoryEvent { }
+        Mock Send-CIPPBaselineAlert { }
+        Mock Remove-CIPPAzDataTableEntity { }
+        Mock Write-LogMessage { }
+    }
+
+    It 'a steady-state write-always standard already Compliant does NOT re-alert every run' {
+        Mock Get-CIPPAzDataTableEntity { @(& $script:PriorRow 'Compliant') }
+        $Result = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        Should -Invoke Invoke-CIPPBaselineTestWrite -Times 1 -Exactly
+        $Result.Outcome | Should -Be 'Remediated'
+        $Result.Status | Should -Be 'Compliant'
+        $Result.AlertEvent | Should -BeNullOrEmpty
+        Should -Invoke Send-CIPPBaselineAlert -Times 0 -Exactly
+    }
+
+    It 'an executor that reports Changed=$false records Compliant, not Remediated, and never alerts' {
+        Mock Get-CIPPAzDataTableEntity { @(& $script:PriorRow 'Drift') }
+        Mock Invoke-CIPPBaselineTestWrite { [PSCustomObject]@{ Changed = $false } }
+        $Result = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        Should -Invoke Invoke-CIPPBaselineTestWrite -Times 1 -Exactly
+        $Result.Outcome | Should -Be 'Compliant'
+        $Result.Status | Should -Be 'Compliant'
+        $Result.Remediated | Should -Not -Be $true
+        $Result.AlertEvent | Should -BeNullOrEmpty
+        Should -Invoke Send-CIPPBaselineAlert -Times 0 -Exactly
+        Should -Invoke Write-LogMessage -Times 0 -Exactly -ParameterFilter { $message -like 'Successfully changed*' }
+    }
+
+    It 'alerts on the transition INTO remediation - a drifted prior still fires once' {
+        Mock Get-CIPPAzDataTableEntity { @(& $script:PriorRow 'Drift') }
+        $Result = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        $Result.AlertEvent | Should -Be 'Remediated'
+        Should -Invoke Send-CIPPBaselineAlert -Times 1 -Exactly
+    }
+
+    It 'alerts on first sight, where there is no prior row at all' {
+        Mock Get-CIPPAzDataTableEntity { @() }
+        $Result = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        $Result.AlertEvent | Should -Be 'Remediated'
+        Should -Invoke Send-CIPPBaselineAlert -Times 1 -Exactly
+    }
+
+    It 'a failed write persists Error, not Drift with an empty diff, and never alerts' {
+        Mock Get-CIPPAzDataTableEntity { @(& $script:PriorRow 'Drift') }
+        Mock New-CIPPDbRequest { [PSCustomObject]@{ enabled = $false } }
+        Mock Invoke-CIPPBaselineTestWrite { throw 'Request failed with status code Forbidden' }
+        $Result = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        $Result.Outcome | Should -Be 'Error'
+        $Result.Status | Should -Be 'Error'
+        $Result.AlertEvent | Should -BeNullOrEmpty
+        $script:Persisted.Status | Should -Be 'Error'
+        Should -Invoke Send-CIPPBaselineAlert -Times 0 -Exactly
+    }
+
+    It 'a failed write carries the exception detail as LogData so the response body survives' {
+        Mock Get-CIPPAzDataTableEntity { @(& $script:PriorRow 'Drift') }
+        Mock New-CIPPDbRequest { [PSCustomObject]@{ enabled = $false } }
+        Mock Invoke-CIPPBaselineTestWrite { throw 'Request failed with status code Forbidden' }
+        $null = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        Should -Invoke Write-LogMessage -Times 1 -Exactly -ParameterFilter {
+            $Sev -eq 'Error' -and $message -like 'Failed to change*' -and $null -ne $LogData
+        }
+    }
+
+    It 'a failed write keeps a pending deny - an operator order outlives the failure' {
+        Mock Get-CIPPAzDataTableEntity { @(& $script:PriorRow 'Denied - Remediate Pending') }
+        Mock New-CIPPDbRequest { [PSCustomObject]@{ enabled = $false } }
+        Mock Invoke-CIPPBaselineTestWrite { throw 'Request failed with status code Forbidden' }
+        $Result = Invoke-CIPPBaselineStandard -Item $script:WriteAlwaysItem -Mode 'run'
+        $Result.Outcome | Should -Be 'Error'
+        $Result.Status | Should -Be 'Denied - Remediate Pending'
     }
 }

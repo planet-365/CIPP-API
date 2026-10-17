@@ -4,6 +4,7 @@
 
 BeforeAll {
     $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
+    Add-Type -Path (Join-Path $RepoRoot 'Shared/CIPPSharp/bin/CIPPSharp.dll')
     . (Get-ChildItem -Path (Join-Path $RepoRoot 'Modules') -Recurse -Filter 'Add-CIPPDbItem.ps1' | Select-Object -First 1 -ExpandProperty FullName)
 
     $script:Written = @{}
@@ -38,6 +39,17 @@ Describe 'Add-CIPPDbItem shape' {
         $Shape | Should -Contain 'apps.name:string'
         $Shape | Should -Contain 'lastSeen:null'
         $script:Written['Devices-Count'].DataCount | Should -Be 2
+    }
+
+    It 'samples only the first 10 rows' {
+        @(foreach ($i in 1..20) {
+                if ($i -le 10) { [PSCustomObject]@{ id = "d$i"; early = 'x' } } else { [PSCustomObject]@{ id = "d$i"; late = 'y' } }
+            }) | Add-CIPPDbItem -TenantFilter 'contoso.onmicrosoft.com' -Type 'Devices' -AddCount
+
+        $Shape = @(Get-Shape)
+        $Shape | Should -Contain 'early:string'
+        $Shape | Should -Not -Contain 'late:string'
+        $script:Written['Devices-Count'].DataCount | Should -Be 20
     }
 
     It 'keeps the recorded shape when a count-only call follows the rows' {

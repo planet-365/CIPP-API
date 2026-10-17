@@ -1,18 +1,21 @@
 BeforeAll {
+    Add-Type -Path "$PSScriptRoot/../../Shared/CIPPSharp/bin/CIPPSharp.dll"
     . "$PSScriptRoot/../../Modules/CippExtensions/Public/Hudu/Find-HuduDeviceMatch.ps1"
+    . "$PSScriptRoot/../../Modules/CippExtensions/Public/Hudu/Get-HuduDeviceMatchKey.ps1"
     . "$PSScriptRoot/../../Modules/CippExtensions/Public/Hudu/Get-HuduBitLockerKeySlot.ps1"
     . "$PSScriptRoot/../../Modules/CippExtensions/Public/Hudu/Get-HuduBitLockerSyncField.ps1"
     . "$PSScriptRoot/../../Modules/CippExtensions/Public/Hudu/Invoke-HuduExtensionSync.ps1"
 
     function Connect-HuduAPI { param($Configuration) }
+    function Get-HuduAppInfo { [CmdletBinding()] param() [PSCustomObject]@{ version = '2.46.1'; date = '2026-09-01' } }
     function Get-Tenants { param($TenantFilter, [switch]$IncludeErrors) }
     function Get-AssignedNameMap { }
     function Get-AssignedMap { }
     function Get-CIPPTable { param($TableName) }
     function Get-CIPPAzDataTableEntity { param($Filter) }
-    function Get-CippExtensionReportingData { param($TenantFilter, [switch]$IncludeMailboxes) }
+    function Get-CippExtensionReportingData { param($TenantFilter, [switch]$IncludeMailboxes, [string[]]$Exclude) }
     function Get-HuduCompanies { param($Id) }
-    function Add-HuduAssetLayoutField { param($AssetLayoutId, $Label, $FieldType, $Position, $ShowInList) }
+    function Add-HuduAssetLayoutField { param($AssetLayoutId, $Label, $FieldType, $Position, $ShowInList, $AssetLayout) }
     function Get-HuduAssetLayouts { param($Id, $LayoutId) }
     function Get-HuduAssets { param($CompanyId, $AssetLayoutId) }
     function Get-HuduRelations { }
@@ -26,7 +29,7 @@ BeforeAll {
     function Get-HuduFormattedField { param($Title, $Value) }
     function Get-HuduFormattedBlock { param($Heading, $Body) }
     function Get-StringHash { param($String) }
-    function Set-HuduAsset { param($AssetId, $Name, $CompanyId, $AssetLayoutId, $Fields, $PrimarySerial) }
+    function Set-HuduAsset { param($AssetId, $Name, $CompanyId, $AssetLayoutId, $Fields, $PrimarySerial, $ExistingAsset) }
     function New-HuduAsset { param($Name, $CompanyId, $AssetLayoutId, $Fields, $PrimarySerial) }
     function New-HuduRelation { param($FromableType, $FromableID, $ToableType, $ToableID) }
     function Set-HuduMagicDash { param($Title, $CompanyName, $Message, $Icon, $Content, $Shade) }
@@ -145,7 +148,7 @@ Describe 'Invoke-HuduExtensionSync credential integration' {
             foreach ($Key in $Fields.Keys) {
                 $Existing = $script:HuduDevice.fields | Where-Object slug -eq $Key | Select-Object -First 1
                 if ($Existing) { $Existing.value = $Fields[$Key] }
-                else { $script:HuduDevice.fields += [PSCustomObject]@{ label = $Labels[$Key]; slug = $Key; value = $Fields[$Key] } }
+                else { $script:HuduDevice.fields = @($script:HuduDevice.fields; [PSCustomObject]@{ label = $Labels[$Key]; slug = $Key; value = $Fields[$Key] }) }
             }
         }
         Mock Set-HuduMagicDash { }
@@ -172,6 +175,35 @@ Describe 'Invoke-HuduExtensionSync credential integration' {
         Should -Invoke Find-HuduDeviceMatch -Times 2 -Exactly -ParameterFilter {
             'SystemSerialNumber' -in $ExcludeSerials -and 'CUSTOM-PLACEHOLDER' -in $ExcludeSerials
         }
+    }
+
+    It 'skips password retrieval and blanks stored secrets for a tenant opted out by mapping' {
+        $script:HuduDevice.fields = @($script:HuduDevice.fields
+            [PSCustomObject]@{ label = 'LAPS Account'; slug = 'laps_account'; value = '.\Administrator' }
+            [PSCustomObject]@{ label = 'LAPS Password'; slug = 'laps_password'; value = 'laps-secret' }
+            [PSCustomObject]@{ label = 'BitLocker OS Drive 1 Recovery Key'; slug = 'bitlocker_os_drive_1_recovery_key'; value = 'bitlocker-secret' }
+        )
+        Mock Get-CIPPAzDataTableEntity {
+            if ($Filter -like "*PartitionKey eq 'HuduMapping'*") {
+                return @(
+                    [PSCustomObject]@{ PartitionKey = 'HuduMapping'; RowKey = 'tenant-1'; IntegrationId = 20; IntegrationName = 'Contoso'; SyncPasswords = $false }
+                    [PSCustomObject]@{ PartitionKey = 'HuduMapping'; RowKey = 'Devices'; IntegrationId = 10; IntegrationName = 'Computers' }
+                )
+            }
+            if ($Filter -like "*InstanceProperties*") { return [PSCustomObject]@{ Value = 'cipp.example.test' } }
+            if ($Filter -like "*CacheMetadata*") { return [PSCustomObject]@{ LastRefresh = (Get-Date).ToUniversalTime().ToString('o') } }
+            if ($Filter -like "*PartitionKey eq 'HuduRelation'*") { return @() }
+        }
+
+        $null = Invoke-HuduExtensionSync -Configuration $Configuration -TenantFilter 'contoso.onmicrosoft.com'
+
+        Should -Invoke New-GraphGetRequest -Times 0 -Exactly -ParameterFilter { $Uri -like '*deviceLocalCredentials*' }
+        Should -Invoke Get-CIPPLapsPassword -Times 0 -Exactly
+        Should -Invoke Get-CIPPBitLockerKey -Times 0 -Exactly
+        $script:HuduDevice.fields.Where({ $_.slug -eq 'laps_password' }).value | Should -Be ''
+        $script:HuduDevice.fields.Where({ $_.slug -eq 'laps_account' }).value | Should -Be ''
+        $script:HuduDevice.fields.Where({ $_.slug -eq 'bitlocker_os_drive_1_recovery_key' }).value | Should -Be ''
+        Should -Invoke Write-LogMessage -ParameterFilter { $Message -eq 'Password data excluded for this tenant by mapping' }
     }
 }
 
@@ -340,5 +372,35 @@ Describe 'Invoke-HuduExtensionSync roles table' {
         $script:MagicDash | Should -Match 'Eligible Admin \(until 2030-01-15\)'
         $script:MagicDash | Should -Not -Match 'Expired Admin'
         $script:MagicDash | Should -Not -Match 'Empty Role'
+    }
+}
+
+Describe 'Invoke-HuduExtensionSync API pre-flight check' {
+    BeforeEach {
+        Mock Connect-HuduAPI { }
+        Mock Write-LogMessage { }
+        Mock Get-Tenants { [PSCustomObject]@{ displayName = 'Contoso'; defaultDomainName = 'contoso.onmicrosoft.com'; customerId = 'tenant-1' } }
+        Mock Get-AssignedNameMap { }
+        Mock Get-HuduCompanies { }
+    }
+
+    It 'stops before any sync work and reports the Hudu error when the API rejects the key' {
+        Mock Get-HuduAppInfo { Write-Error "'{ `"error`": `"Unauthorized IP Address`" }'" }
+
+        $Result = Invoke-HuduExtensionSync -Configuration ([PSCustomObject]@{ Hudu = [PSCustomObject]@{} }) -TenantFilter 'contoso.onmicrosoft.com' 3>$null
+
+        @($Result.Errors).Count | Should -Be 1
+        $Result.Errors[0] | Should -BeLike '*Hudu API check failed, sync skipped*Unauthorized IP Address*'
+        Should -Invoke Get-AssignedNameMap -Times 0 -Exactly
+        Should -Invoke Get-HuduCompanies -Times 0 -Exactly
+    }
+
+    It 'treats the 0.0.0.0 fallback version as a failed connection' {
+        Mock Get-HuduAppInfo { [PSCustomObject]@{ version = '0.0.0.0'; date = '2000-01-01' } }
+
+        $Result = Invoke-HuduExtensionSync -Configuration ([PSCustomObject]@{ Hudu = [PSCustomObject]@{} }) -TenantFilter 'contoso.onmicrosoft.com' 3>$null
+
+        $Result.Errors[0] | Should -BeLike '*Hudu API check failed*no version returned*'
+        Should -Invoke Get-HuduCompanies -Times 0 -Exactly
     }
 }

@@ -24,7 +24,7 @@ BeforeAll {
     function Get-CIPPBecMessageTrace { param($TenantFilter, $SenderAddress, $RecipientAddress, $StartDate, $EndDate, $Anchor, $PageSize, $MaxPages) }
     # Full-scope collectors
     function Get-CIPPBecMailboxInventory { param($TenantFilter, $UserPrincipalName, $Heuristics, $AcceptedDomains) }
-    function Get-CIPPBecUserGrants { param($TenantFilter, $UserId, $Heuristics, $RogueAppFeed) }
+    function Get-CIPPBecUserGrants { param($TenantFilter, $UserId, $Heuristics, $RogueAppFeed, $StartDate) }
     function Get-CIPPBecTransportRules { param($TenantFilter, $StartDate, $EndDate, $Heuristics, $Anchor) }
     function Get-CIPPBecReceivedMailFindings { param($TenantFilter, $UserPrincipalName, $StartDate, $EndDate, $Heuristics, $AcceptedDomains, $Anchor, [switch]$IncludeDefender) }
     function Get-CIPPBecDirectoryAudits { param($TenantFilter, $UserId, $StartDate, $Heuristics, $Cap) }
@@ -38,7 +38,14 @@ BeforeAll {
     function Get-CIPPBecAttackerActivity { param($TenantFilter, $UserPrincipalName, $StartDate, $EndDate, $Heuristics, $Verdicts, $SignIns, $NonInteractiveSignIns, $MailRecords, $SharingChanges, $KnownSubjects, $Anchor) }
     function Get-CIPPBecDelegatedAccess { param($TenantFilter, $UserPrincipalName, $UserDisplayName, $PermissionChanges, $MailActivity, $AttackerMail) }
     function Get-CIPPBecBlastRadius { param($TenantFilter, $UserId, $UserPrincipalName, $Verdicts, $Peers, $StartDate, $EndDate, $Heuristics, $Anchor) }
-    function Invoke-CIPPBecIPAnalysis { param($TenantFilter, $UserId, $UserPrincipalName, $Results, $Heuristics, $WindowStart, $UsageLocation, $Anchor, $Baseline, $KnownPeers, $Overrides, $ExtraPeers, $TechnicianIPs, [switch]$SampleColleagues) }
+    function New-GraphPOSTRequest { param($uri, $tenantid, $body, $AsApp, $type, $scope) }
+    # The run state table, in memory; the real Get-/Set-CIPPBecRunState run over it so every phase's
+    # hand-off goes through the same JSON round trip as in production.
+    function Get-CIPPTable { param($TableName) @{ TableName = $TableName } }
+    function Add-CIPPAzDataTableEntity { param($TableName, $Entity, [switch]$Force, $OperationType) }
+    function Get-CIPPAzDataTableEntity { param($TableName, $Filter, $Property, $First) }
+    function Remove-CIPPAzDataTableEntity { param($TableName, $Entity, [switch]$Force) }
+    function Invoke-CIPPBecIPAnalysis { param($TenantFilter, $UserId, $UserPrincipalName, $Results, $Heuristics, $WindowStart, $UsageLocation, $Anchor, $Baseline, $KnownPeers, $Overrides, $ExtraPeers, $TechnicianIPs, $TravelWindows, [switch]$SampleColleagues, [switch]$SkipPeerLookup) }
 
     # Real pieces under test alongside the run
     . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/ConvertTo-CIPPBecHostAddress.ps1')
@@ -48,12 +55,18 @@ BeforeAll {
     . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/New-CIPPBecCaseId.ps1')
     . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Get-CIPPBecScore.ps1')
     . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Get-CIPPBecRunSteps.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Search-CIPPBecSignIn.ps1')
     . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Get-CIPPBecErrorInfo.ps1')
     . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Set-CIPPBecIPVerdictStamp.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Find-CIPPBecApprovedTravel.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Get-CIPPBecRunState.ps1')
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/BEC/Set-CIPPBecRunState.ps1')
     $FunctionPath = Get-ChildItem -Path (Join-Path $RepoRoot 'Modules') -Recurse -Filter 'Push-BECRun.ps1' | Select-Object -First 1
     . $FunctionPath.FullName
 
     function Empty { New-CIPPBecCollectorResult -Data @() }
+    # a run is one job per phase, queued in order
+    function Invoke-BecRun { param($Item) foreach ($RunStep in @(Get-CIPPBecRunSteps)) { Push-BECRun -Item ($Item + @{ Step = $RunStep.Key }) } }
     $script:Item = @{ TenantFilter = 'contoso.com'; UserID = 'user-guid'; userName = 'victim@contoso.com'; CaseId = 'BEC-20260820120000-test01' }
 }
 
@@ -74,6 +87,14 @@ Describe 'Push-BECRun' {
         Mock New-CIPPAsyncDeployment { $JobId }
         Mock Write-LogMessage { }
         Mock Set-CippBecCaseContext { }
+        $script:StateRows = [System.Collections.Generic.List[object]]::new()
+        Mock Add-CIPPAzDataTableEntity {
+            foreach ($Old in @($script:StateRows | Where-Object { $_.PartitionKey -eq $Entity.PartitionKey -and $_.RowKey -eq $Entity.RowKey })) { $null = $script:StateRows.Remove($Old) }
+            $script:StateRows.Add([pscustomobject]$Entity)
+        }
+        Mock Get-CIPPAzDataTableEntity { $PK = [regex]::Match($Filter, "PartitionKey eq '([^']*)'").Groups[1].Value; @($script:StateRows | Where-Object { $_.PartitionKey -eq $PK }) }
+        Mock Remove-CIPPAzDataTableEntity { foreach ($Old in @($Entity)) { foreach ($Row in @($script:StateRows | Where-Object { $_.PartitionKey -eq $Old.PartitionKey -and $_.RowKey -eq $Old.RowKey })) { $null = $script:StateRows.Remove($Row) } } }
+        Mock New-GraphPOSTRequest { [pscustomobject]@{ value = @([pscustomobject]@{ id = '1b4e28ba-2fa1-11d2-883f-0016d3cca427'; userPrincipalName = 'assistant@contoso.com' }) } } -ParameterFilter { $uri -like '*directoryObjects/getByIds*' }
         Mock Get-CIPPGeoIPLocationBatch { @{ '203.0.113.10' = [pscustomobject]@{ CountryOrRegion = 'NG'; City = 'Lagos' } } }
         Mock New-ExoRequest {
             switch ($cmdlet) {
@@ -113,6 +134,11 @@ Describe 'Push-BECRun' {
                     'IntuneDevices' { [pscustomobject]@{ id = 'IntuneDevices'; status = 403; body = [pscustomobject]@{ error = [pscustomobject]@{ message = 'No Intune licence' } } } }
                     'SuspectUser' { [pscustomobject]@{ id = 'SuspectUser'; status = 200; body = [pscustomobject]@{ id = 'user-guid'; displayName = 'Victim'; userPrincipalName = 'victim@contoso.com'; usageLocation = 'NL'; country = 'Netherlands' } } }
                     'MaliciousSPs*' { [pscustomobject]@{ id = $Request.id; status = 200; body = [pscustomobject]@{ value = @() } } }
+                    # the user's sign-ins, read in 7-day slices: the row sits in the newest slice
+                    's[0-9]*' {
+                        $Rows = @(if ($Request.url -like '*signIns*' -and $Request.id -eq "s$(@($Requests).Count - 1)") { [pscustomobject]@{ id = 's1'; createdDateTime = '2026-08-19T03:00:00Z'; resourceDisplayName = 'Office 365 Exchange Online'; clientAppUsed = 'Browser'; conditionalAccessStatus = 'success'; status = [pscustomobject]@{ errorCode = 0 }; ipAddress = '203.0.113.10'; location = [pscustomobject]@{ countryOrRegion = 'NG'; city = 'Lagos' } } })
+                        [pscustomobject]@{ id = $Request.id; status = 200; body = [pscustomobject]@{ value = $Rows } }
+                    }
                 }
             }
         }
@@ -152,8 +178,47 @@ Describe 'Push-BECRun' {
         Mock Get-CIPPPartnerUserLookup { @{ '0123abcd-4567-4890-8abc-def012345678' = @{ userPrincipalName = 'tech@msp.example' } } }
     }
 
+    It 'looks up the other accounts on the addresses in a step of its own, on the first step''s baseline' {
+        $script:AnalysisCalls = [System.Collections.Generic.List[object]]::new()
+        Mock Invoke-CIPPBecIPAnalysis {
+            $script:AnalysisCalls.Add([pscustomobject]@{ Skip = $SkipPeerLookup.IsPresent; Sample = $SampleColleagues.IsPresent; Baseline = $Baseline })
+            [pscustomobject]@{
+                Baseline    = New-CIPPBecCollectorResult -Data ([pscustomobject]@{ Successful = 12 }) -Count 12
+                Guidance    = Empty
+                PeersResult = New-CIPPBecCollectorResult -Data @([pscustomobject]@{ IP = '203.0.113.10' })
+                Peers       = @{ '203.0.113.10' = [pscustomobject]@{ IP = '203.0.113.10'; OtherUsers = 0 } }
+                Geo         = @{}
+                Verdicts    = @([pscustomobject]@{ IP = '203.0.113.10'; Verdict = $(if ($SkipPeerLookup) { 'Suspicious' } else { 'LikelyAttacker' }) })
+                Events      = @()
+            }
+        }
+        Invoke-BecRun -Item $script:Item
+        $script:AnalysisCalls.Count | Should -Be 2
+        $script:AnalysisCalls[0].Skip | Should -BeTrue
+        $script:AnalysisCalls[0].Sample | Should -BeFalse
+        $script:AnalysisCalls[1].Skip | Should -BeFalse
+        $script:AnalysisCalls[1].Sample | Should -BeTrue
+        $script:AnalysisCalls[1].Baseline.Successful | Should -Be 12 -Because 'the lookup step re-uses the saved baseline'
+        $script:Saved.Results.IPVerdicts[0].Verdict | Should -Be 'LikelyAttacker' -Because 'the lookup step''s verdicts replace the first pass'
+        @($script:Saved.Results.IPPeers).Count | Should -Be 1
+    }
+
+    It 'keeps the first verdicts when the other-account lookup fails' {
+        Mock Invoke-CIPPBecIPAnalysis {
+            if ($SampleColleagues) { throw 'The request to graph timed out after 100s.' }
+            [pscustomobject]@{ Baseline = (Empty); Guidance = (Empty); PeersResult = (Empty); Peers = @{}; Geo = @{}; Events = @(); Verdicts = @([pscustomobject]@{ IP = '203.0.113.10'; Verdict = 'Suspicious' }) }
+        }
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Properties.Status | Should -Be 'Completed'
+        $script:Saved.Results.IPVerdicts[0].Verdict | Should -Be 'Suspicious'
+        $script:Saved.Results.SuspectUserSignIns[0].IPVerdict | Should -Be 'Suspicious' -Because 'the rows keep the first step''s stamps'
+        $script:Saved.Results.Completeness.IPVerdicts.Complete | Should -BeTrue
+        $script:Saved.Results.Completeness.IPPeers.Complete | Should -BeFalse
+        $script:Saved.Results.Completeness.IPPeers.Error | Should -Not -BeNullOrEmpty
+    }
+
     It 'runs every collector (a legacy Scope on the queue item is ignored), flattens their data and scores the signals' {
-        Push-BECRun -Item ($script:Item + @{ Scope = 'Quick'; RequestedFromIP = '192.0.2.77'; RequestedBy = 'tech@msp.com' })
+        Invoke-BecRun -Item ($script:Item + @{ Scope = 'Quick'; RequestedFromIP = '192.0.2.77'; RequestedBy = 'tech@msp.com' })
         foreach ($Collector in 'Get-CIPPBecMailboxInventory', 'Get-CIPPBecUserGrants', 'Get-CIPPBecTransportRules', 'Get-CIPPBecReceivedMailFindings', 'Get-CIPPBecDirectoryAudits', 'Get-CIPPBecRegisteredDevices', 'Get-CIPPBecNonInteractiveSignIns', 'Get-CIPPBecMailActivity', 'Get-CIPPBecRiskState') {
             Should -Invoke $Collector -Times 1 -Because "$Collector runs on Full scope"
         }
@@ -206,15 +271,15 @@ Describe 'Push-BECRun' {
         $R.BlastRadius[0].UserPrincipalName | Should -Be 'cfo@contoso.com'
         $R.Completeness.BlastRadius.Complete | Should -BeTrue
         $script:BlastPeers | Should -BeOfType [hashtable] -Because "the analysis' tenant-wide sign-in lookup is reused"
-        # Quick score 21 + flagged delegation 2 + catalog grant 5 + risky transport change 4 + attacker IP 4 + attacker mail 3
-        $R.Score.Value | Should -Be 39
+        # Quick score 18 + flagged delegation 2 + catalog grant 5 + risky transport change 4 + attacker IP 4 + attacker mail 3
+        $R.Score.Value | Should -Be 36
     }
 
     It 'resolves a missing UPN from the object id, writes it back, and runs the investigation' {
         # A run queued with only the object id (an API/MCP caller, or a page race) must not run the
         # mailbox collectors with an empty UPN; the run resolves it from the id first.
         Mock New-GraphGetRequest { [pscustomobject]@{ userPrincipalName = 'victim@contoso.com'; displayName = 'Victim' } } -ParameterFilter { $uri -like '*/users/user-guid*' }
-        Push-BECRun -Item @{ TenantFilter = 'contoso.com'; UserID = 'user-guid'; userName = ''; CaseId = 'BEC-20260820120000-test02' }
+        Invoke-BecRun -Item @{ TenantFilter = 'contoso.com'; UserID = 'user-guid'; userName = ''; CaseId = 'BEC-20260820120000-test02' }
         Should -Invoke New-GraphGetRequest -Times 1 -ParameterFilter { $uri -like '*/users/user-guid*' }
         Should -Invoke Set-CIPPBecReport -Times 1 -ParameterFilter { $Properties.UserPrincipalName -eq 'victim@contoso.com' }
         Should -Invoke Get-CIPPBecMailboxInventory -Times 1 -ParameterFilter { $UserPrincipalName -eq 'victim@contoso.com' }
@@ -223,7 +288,7 @@ Describe 'Push-BECRun' {
 
     It 'fails a blank-UPN run cleanly when the object id cannot be resolved, without running the collectors' {
         # the default New-GraphGetRequest mock returns nothing for an unknown users/{id} lookup
-        Push-BECRun -Item @{ TenantFilter = 'contoso.com'; UserID = 'ghost-guid'; userName = ''; CaseId = 'BEC-20260820120000-test03' }
+        Invoke-BecRun -Item @{ TenantFilter = 'contoso.com'; UserID = 'ghost-guid'; userName = ''; CaseId = 'BEC-20260820120000-test03' }
         $script:Saved.Properties.Status | Should -Be 'Error'
         $script:Saved.Properties.ErrorMessage | Should -Match 'user principal name'
         Should -Invoke Get-CIPPBecMailboxInventory -Times 0
@@ -232,7 +297,7 @@ Describe 'Push-BECRun' {
 
     It 'degrades a collector that throws to an error marker without failing the run' {
         Mock Get-CIPPBecUserGrants { throw 'Graph exploded' }
-        Push-BECRun -Item ($script:Item + @{ Scope = 'Full' })
+        Invoke-BecRun -Item ($script:Item + @{ Scope = 'Full' })
         $R = $script:Saved.Results
         $script:Saved.Properties.Status | Should -Be 'Completed'
         $R.Completeness.UserGrants.Complete | Should -BeFalse
@@ -250,7 +315,7 @@ Describe 'Push-BECRun' {
                 default { @() }
             }
         }
-        Push-BECRun -Item $script:Item
+        Invoke-BecRun -Item $script:Item
         $R = $script:Saved.Results
         $R.ExtractResult | Should -Match 'disabled'
         $R.Completeness.AuditLog.Complete | Should -BeFalse
@@ -259,33 +324,53 @@ Describe 'Push-BECRun' {
         Should -Invoke Search-CIPPBecAuditLog -Times 0
     }
 
-    It 'records a failed run instead of leaving it waiting' {
+    It 'keeps going when a phase fails, and records the failed phase on the case' {
         Mock New-GraphBulkRequest { throw 'bulk blew up' }
-        Push-BECRun -Item $script:Item
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Properties.Status | Should -Be 'Completed'
+        $R = $script:Saved.Results
+        $R.Completeness.'Tenant users, MFA methods and applications'.Complete | Should -BeFalse
+        $R.Completeness.'Tenant users, MFA methods and applications'.Error | Should -Match 'bulk blew up'
+        $R.UserGrants[0].Risk | Should -Be 'CatalogMatch' -Because 'the phases after the failed one still ran'
+        $script:Saved.Properties.IncompleteCount | Should -BeGreaterThan 0
+        Should -Invoke Set-CippBecCaseContext -Times 15 -ParameterFilter { [string]::IsNullOrEmpty($CaseId) }
+    }
+
+    It 'fails the run when the last phase (score and report) fails' {
+        Mock Get-CIPPBecScore { throw 'score blew up' }
+        Invoke-BecRun -Item $script:Item
         $script:Saved.Properties.Status | Should -Be 'Error'
-        $script:Saved.Properties.ErrorMessage | Should -Match 'bulk blew up'
+        $script:Saved.Properties.ErrorMessage | Should -Match 'score blew up'
         $script:Saved.Results | Should -BeNullOrEmpty
-        Should -Invoke Set-CippBecCaseContext -Times 1 -ParameterFilter { [string]::IsNullOrEmpty($CaseId) }
+        $script:StateRows.Count | Should -Be 0 -Because 'the run state is cleared either way'
+    }
+
+    It 'hands each phase''s data to the later ones through the run state and clears it at the end' {
+        $script:Seen = [System.Collections.Generic.List[int]]::new()
+        Mock Get-CIPPBecDelegatedAccess { $script:Seen.Add(@($PermissionChanges).Count); New-CIPPBecCollectorResult -Data @() }
+        Invoke-BecRun -Item $script:Item
+        $script:Seen[0] | Should -Be 1 -Because 'the audit-log phase''s permission change reached the attacker-activity phase'
+        $script:StateRows.Count | Should -Be 0
     }
 
     Context 'live progress (the async-deployment job the page polls)' {
-        It 'creates the job when the queue did not, marks the run Running, walks each of the fourteen phases running then done, and ends succeeded' {
-            Push-BECRun -Item $script:Item
-            Should -Invoke New-CIPPAsyncDeployment -Times 1 -ParameterFilter { $JobId -eq 'BEC-20260820120000-test01' -and $Names -contains 'victim@contoso.com' -and @($StepTitles).Count -eq 14 -and $Source -eq 'BEC' }
+        It 'creates the job when the queue did not, marks the run Running, walks each of the fifteen phases running then done, and ends succeeded' {
+            Invoke-BecRun -Item $script:Item
+            Should -Invoke New-CIPPAsyncDeployment -Times 1 -ParameterFilter { $JobId -eq 'BEC-20260820120000-test01' -and $Names -contains 'victim@contoso.com' -and @($StepTitles).Count -eq 15 -and $Source -eq 'BEC' }
             Should -Invoke Set-CIPPBecReport -Times 1 -ParameterFilter { $Properties.Status -eq 'Running' -and $Properties.StartedAt }
             @($script:StatusCalls.Status) | Should -Be @('running', 'succeeded')
             $script:StatusCalls[-1].Logs | Should -Match 'threat level High'
-            @(($script:StepCalls | Where-Object { $_.Status -eq 'running' }).Index) | Should -Be @(0..13) -Because 'the phases run in order'
-            @(($script:StepCalls | Where-Object { $_.Status -eq 'succeeded' }).Index) | Should -Be @(0..13)
+            @(($script:StepCalls | Where-Object { $_.Status -eq 'running' }).Index) | Should -Be @(0..14) -Because 'the phases run in order'
+            @(($script:StepCalls | Where-Object { $_.Status -eq 'succeeded' }).Index) | Should -Be @(0..14)
             ($script:StepCalls | Where-Object { $_.Status -eq 'succeeded' })[-1].Message | Should -Match '^Threat level High'
             @($script:StepCalls | Where-Object { $_.Status -eq 'failed' }).Count | Should -Be 0
             $script:StepCalls | ForEach-Object { $_.JobId | Should -Be 'BEC-20260820120000-test01'; $_.Name | Should -Be 'victim@contoso.com' }
         }
 
-        It 'marks the phase that was running as failed, and the job failed, when the run throws' {
+        It 'marks a phase that throws as failed and still finishes the run' {
             Mock New-GraphBulkRequest { throw 'bulk blew up' }
-            Push-BECRun -Item $script:Item
-            @($script:StatusCalls.Status) | Should -Be @('running', 'failed')
+            Invoke-BecRun -Item $script:Item
+            @($script:StatusCalls.Status) | Should -Be @('running', 'succeeded')
             $Failed = @($script:StepCalls | Where-Object { $_.Status -eq 'failed' })
             $Failed.Count | Should -Be 1
             $Failed[0].Index | Should -Be 4 -Because 'the bulk Graph read belongs to the tenant phase'
@@ -294,15 +379,26 @@ Describe 'Push-BECRun' {
 
         It 'recreates the job at start so a Craft retry shows a clean progression instead of the dead attempt''s steps' {
             Mock Get-CIPPAsyncDeployment { @([pscustomobject]@{ Name = 'victim@contoso.com'; Status = 'running'; Steps = @([pscustomobject]@{ Title = 'x'; Status = 'succeeded'; Message = 'Done' }); Logs = '' }) }
-            Push-BECRun -Item $script:Item
-            Should -Invoke New-CIPPAsyncDeployment -Times 1 -ParameterFilter { $JobId -eq 'BEC-20260820120000-test01' -and @($StepTitles).Count -eq 14 }
+            Invoke-BecRun -Item $script:Item
+            Should -Invoke New-CIPPAsyncDeployment -Times 1 -ParameterFilter { $JobId -eq 'BEC-20260820120000-test01' -and @($StepTitles).Count -eq 15 }
             @($script:StatusCalls.Status) | Should -Be @('running', 'succeeded')
+        }
+
+        It 'fails an earlier phase left running (its worker timed out) and flags its checks on the case' {
+            $script:JobSteps = @(Get-CIPPBecRunSteps | ForEach-Object { [pscustomobject]@{ Title = $_.Title; Status = 'succeeded' } })
+            $script:JobSteps[3].Status = 'running'
+            Mock Get-CIPPAsyncDeployment { @([pscustomobject]@{ Name = 'victim@contoso.com'; Status = 'running'; Steps = $script:JobSteps }) }
+            Invoke-BecRun -Item $script:Item
+            @($script:StepCalls | Where-Object { $_.Status -eq 'failed' -and $_.Index -eq 3 }).Count | Should -BeGreaterThan 0
+            $script:Saved.Results.Completeness.'Sent message trace'.Error | Should -Match 'stopped before it finished'
         }
     }
 
-    It 'mints a case id when the queue item carries none' {
-        Push-BECRun -Item @{ TenantFilter = 'contoso.com'; UserID = 'user-guid'; userName = 'victim@contoso.com' }
-        $script:Saved.CaseId | Should -Match '^BEC-\d{14}-[0-9a-f]{6}$'
+    It 'does nothing without a case id or a known phase' {
+        Push-BECRun -Item @{ TenantFilter = 'contoso.com'; UserID = 'user-guid'; userName = 'victim@contoso.com'; Step = 'AuditLog' }
+        Push-BECRun -Item ($script:Item + @{ Step = 'Nope' })
+        Push-BECRun -Item $script:Item
+        Should -Invoke Set-CIPPBecReport -Times 0
     }
 
     It 'stamps partner (GDAP) and CIPP actors on audited rows so the case can list them separately' {
@@ -315,7 +411,7 @@ Describe 'Push-BECRun' {
         $PriorAppId = $env:ApplicationID
         $env:ApplicationID = '11111111-2222-4333-8444-555555555555'
         try {
-            Push-BECRun -Item $script:Item
+            Invoke-BecRun -Item $script:Item
         } finally {
             $env:ApplicationID = $PriorAppId
         }
@@ -327,13 +423,13 @@ Describe 'Push-BECRun' {
     }
 
     It 'does nothing without a tenant or user' {
-        Push-BECRun -Item @{ TenantFilter = 'contoso.com' }
+        Invoke-BecRun -Item @{ TenantFilter = 'contoso.com'; CaseId = 'BEC-20260820120000-test04' }
         Should -Invoke Set-CIPPBecReport -Times 0
     }
 
     It 'preflight skips Identity Protection when the tenant has no Entra ID P2 - without calling it' {
         Mock Get-CIPPTenantCapabilities { [pscustomobject]@{ AAD_PREMIUM = $true; INTUNE_A = $true } }
-        Push-BECRun -Item ($script:Item + @{ Scope = 'Full' })
+        Invoke-BecRun -Item ($script:Item + @{ Scope = 'Full' })
         Should -Invoke Get-CIPPBecRiskState -Times 0 -Because 'the licence preflight skips it instead of running it to fail'
         $R = $script:Saved.Results
         $R.Completeness.RiskState.Skipped | Should -BeTrue
@@ -343,7 +439,7 @@ Describe 'Push-BECRun' {
 
     It 'preflight skips the Intune device check when the tenant has no Intune plan - without querying it' {
         Mock Get-CIPPTenantCapabilities { [pscustomobject]@{ AAD_PREMIUM_P2 = $true } }
-        Push-BECRun -Item $script:Item
+        Invoke-BecRun -Item $script:Item
         Should -Invoke New-GraphBulkRequest -Times 0 -ParameterFilter { @($Requests | Where-Object { $_.id -eq 'IntuneDevices' }).Count -gt 0 } -Because 'the licence preflight drops the request instead of sending it to fail'
         $R = $script:Saved.Results
         $R.Completeness.IntuneDevices.Skipped | Should -BeTrue
@@ -355,16 +451,38 @@ Describe 'Push-BECRun' {
 
     It 'runs every gated check when the plan read itself fails - never skips on a failed preflight' {
         Mock Get-CIPPTenantCapabilities { throw 'CacheCapabilities unavailable' }
-        Push-BECRun -Item $script:Item
+        Invoke-BecRun -Item $script:Item
         Should -Invoke Get-CIPPBecRiskState -Times 1
         Should -Invoke New-GraphBulkRequest -Times 1 -ParameterFilter { @($Requests | Where-Object { $_.id -eq 'IntuneDevices' }).Count -gt 0 }
         $script:Saved.Results.Completeness.RiskState.Skipped | Should -BeFalse
         $script:Saved.Properties.Status | Should -Be 'Completed'
     }
 
+    It 'uses the 30-day window for a user licensed for Entra ID P1 or P2' {
+        Mock New-GraphGetRequest { [pscustomobject]@{ assignedPlans = @([pscustomobject]@{ service = 'AADPremiumService'; capabilityStatus = 'Enabled' }) } } -ParameterFilter { $uri -like '*assignedPlans*' }
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Results.AnalysisWindowDays | Should -Be 30
+        Should -Invoke Get-CIPPBecMessageTrace -ParameterFilter { ($EndDate - $StartDate).TotalDays -eq 30 }
+    }
+
+    It 'keeps the 7-day window for an unlicensed user in a P1 tenant, a suspended plan, or a failed plan read' {
+        Mock Get-CIPPTenantCapabilities { [pscustomobject]@{ AAD_PREMIUM_P2 = $true } }
+        Mock New-GraphGetRequest { [pscustomobject]@{ assignedPlans = @([pscustomobject]@{ service = 'exchange'; capabilityStatus = 'Enabled' }) } } -ParameterFilter { $uri -like '*assignedPlans*' }
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Results.AnalysisWindowDays | Should -Be 7 -Because 'the tenant''s plans do not decide the window'
+
+        Mock New-GraphGetRequest { [pscustomobject]@{ assignedPlans = @([pscustomobject]@{ service = 'AADPremiumService'; capabilityStatus = 'Suspended' }) } } -ParameterFilter { $uri -like '*assignedPlans*' }
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Results.AnalysisWindowDays | Should -Be 7
+
+        Mock New-GraphGetRequest { throw 'Graph 503' } -ParameterFilter { $uri -like '*assignedPlans*' }
+        Invoke-BecRun -Item $script:Item
+        $script:Saved.Results.AnalysisWindowDays | Should -Be 7
+    }
+
     It 'classifies a user without a mailbox as skipped mailbox checks, not failed ones' {
         Mock Get-CIPPBecMailboxInventory { $E = New-CIPPBecCollectorResult -Data @() -Error 'Get-Mailbox: Ex41BAF5|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|The specified mailbox doesn''t exist.'; [pscustomobject]@{ MailboxState = $E; Delegations = $E; AddIns = $E } }
-        Push-BECRun -Item $script:Item
+        Invoke-BecRun -Item $script:Item
         $R = $script:Saved.Results
         $R.Completeness.MailboxState.Skipped | Should -BeTrue
         $R.Completeness.Delegations.Skipped | Should -BeTrue
@@ -382,12 +500,50 @@ Describe 'Push-BECRun' {
                 default { @() }
             }
         }
-        Push-BECRun -Item ($script:Item + @{ Scope = 'Full' })
+        Invoke-BecRun -Item ($script:Item + @{ Scope = 'Full' })
         $Rule = @($script:Saved.Results.NewRules)[0]
         $Rule.Suspicious | Should -BeTrue
         $Rule.Risk | Should -Be 'High'
         $Rule.RiskReasons | Should -Contain 'Forwards or redirects mail to an external address'
         $Rule.RiskReasons | Should -Contain 'Deletes messages'
         $Rule.RiskReasons | Should -Contain 'Acts on all incoming mail'
+    }
+
+    It 'marks a rule suspicious only when it hides mail with a reason to, not for an ordinary delete or archive rule' {
+        Mock New-ExoRequest {
+            switch ($cmdlet) {
+                'Get-AdminAuditLogConfig' { [pscustomobject]@{ UnifiedAuditLogIngestionEnabled = $true } }
+                'Get-InboxRule' {
+                    [pscustomobject]@{ Name = 'Newsletters'; Identity = 'n'; Enabled = $true; From = @('news@example.org'); DeleteMessage = $true }
+                    [pscustomobject]@{ Name = 'Receipts'; Identity = 'r'; Enabled = $true; From = @('shop@example.org'); MoveToFolder = 'Archive'; MarkAsRead = $true }
+                    [pscustomobject]@{ Name = 'Team'; Identity = 't'; Enabled = $true; From = @('boss@contoso.com'); ForwardTo = @('"Colleague" [SMTP:colleague@contoso.com]') }
+                    [pscustomobject]@{ Name = '..'; Identity = 'd'; Enabled = $true; From = @('boss@contoso.com'); MoveToFolder = 'Archive'; MarkAsRead = $true }
+                    [pscustomobject]@{ Name = 'Warnings'; Identity = 'w'; Enabled = $true; SubjectOrBodyContainsWords = @('hacked', 'phishing'); DeleteMessage = $true }
+                    [pscustomobject]@{ Name = 'Everything'; Identity = 'e'; Enabled = $true; MoveToFolder = 'Archive' }
+                }
+                'Get-MailboxJunkEmailConfiguration' { [pscustomobject]@{ TrustedSendersAndDomains = @(); BlockedSendersAndDomains = @() } }
+                'Get-AcceptedDomain' { [pscustomobject]@{ DomainName = 'contoso.com' } }
+                default { @() }
+            }
+        }
+        Invoke-BecRun -Item $script:Item
+        $Rules = @($script:Saved.Results.NewRules)
+        foreach ($Name in 'Newsletters', 'Receipts', 'Team') { ($Rules | Where-Object Name -EQ $Name).Suspicious | Should -BeFalse -Because "'$Name' is an ordinary rule" }
+        foreach ($Name in '..', 'Warnings', 'Everything') { ($Rules | Where-Object Name -EQ $Name).Suspicious | Should -BeTrue -Because "'$Name' hides mail for a reason" }
+        ($Rules | Where-Object Name -EQ '..').RiskReasons | Should -Contain 'Blank or punctuation-only rule name'
+    }
+
+    It 'does not count activity from a relay or Microsoft service address as foreign' {
+        Mock Invoke-CIPPBecIPAnalysis {
+            [pscustomobject]@{
+                Baseline = New-CIPPBecCollectorResult -Data ([pscustomobject]@{ Successful = 12 }) -Count 12; Guidance = New-CIPPBecCollectorResult -Data @(); PeersResult = New-CIPPBecCollectorResult -Data @(); Peers = @{}; Geo = @{}; Events = @()
+                Verdicts = @([pscustomobject]@{ IP = '203.0.113.10'; Verdict = 'Service'; SuccessfulSignIns = 0; Activities = 1; Reasons = @() })
+            }
+        }
+        Invoke-BecRun -Item $script:Item
+        $R = $script:Saved.Results
+        $R.SentMessages[0].ForeignLocation | Should -BeTrue -Because 'the row still says where the address is'
+        $R.LocationAnalysis.ForeignSentMessageCount | Should -Be 0
+        $R.LocationAnalysis.ForeignRuleChangeCount | Should -Be 0
     }
 }

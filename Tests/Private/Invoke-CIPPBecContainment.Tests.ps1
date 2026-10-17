@@ -81,6 +81,12 @@ Describe 'Invoke-CIPPBecContainment' {
         Should -Invoke Remove-CIPPUserOAuthGrant -Times 1 -ParameterFilter { @($GrantIds) -contains 'g-bad' -and @($AppRoleAssignmentIds) -contains 'a-bad' }
     }
 
+    It 'records containment on a case that is still being investigated' {
+        Mock Get-CIPPBecReport { [pscustomobject]@{ CaseId = 'BEC-1'; Status = 'Running'; Containment = @() } }
+        $null = Invoke-CIPPBecContainment -TenantFilter 'contoso.com' -UserId 'u1' -UserPrincipalName 'victim@contoso.com' -Actions @('RevokeSessions') -Confirmed -CaseId 'BEC-1'
+        Should -Invoke Set-CIPPBecReport -Times 1 -ParameterFilter { $CaseId -eq 'BEC-1' -and @($Properties.Containment).Count -eq 1 -and @($Properties.Containment)[0].Actions -contains 'RevokeSessions' }
+    }
+
     It 'touches no progress row without a DeploymentId' {
         Mock Set-CIPPAsyncDeploymentStep { }
         Mock Set-CIPPAsyncDeploymentStatus { }
@@ -207,6 +213,15 @@ Describe 'Invoke-CIPPBecContainment' {
         $null = Invoke-CIPPBecContainment -TenantFilter 'contoso.com' -UserPrincipalName 'victim@contoso.com' -Actions @('BlockMobileDevices') -RunResults $script:Run -Parameters @{ MobileDeviceIds = @('dev-1') }
         Should -Invoke New-ExoRequest -Times 0 -ParameterFilter { $cmdlet -eq 'Get-MobileDevice' }
         Should -Invoke Set-CIPPMobileDevice -Times 1 -ParameterFilter { $Quarantine -eq 'true' -and $DeviceId -eq 'dev-1' -and $Guid -eq 'guid-1' }
+    }
+
+    It 'records a failed mobile device block as an error row and keeps going' {
+        Mock Set-CIPPMobileDevice { throw 'Failed to Block Active Sync Device for victim@contoso.com: denied' }
+        $Rows = Invoke-CIPPBecContainment -TenantFilter 'contoso.com' -UserPrincipalName 'victim@contoso.com' -Actions @('BlockMobileDevices', 'ResetPassword') -Confirmed -RunResults $script:Run -Parameters @{ MobileDeviceIds = @('dev-1') }
+        $Row = $Rows | Where-Object { $_.Target -eq 'dev-1' }
+        $Row.state | Should -Be 'error'
+        $Row.resultText | Should -Match 'Failed to Block Active Sync Device'
+        Should -Invoke Set-CIPPResetPassword -Times 1
     }
 
     It 'sets and clears the case log context' {

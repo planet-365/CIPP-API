@@ -206,7 +206,9 @@ function Initialize-CIPPAuth {
                 if ($EnabledClients.Count -gt 0) {
                     $EnabledClientIds = @($EnabledClients.RowKey)
                     # MCPAllowed can round-trip as a bool or string; compare on string form (matches SaveToAzure)
-                    $McpClientIds = @($EnabledClients | Where-Object { "$($_.MCPAllowed)" -eq 'True' } | ForEach-Object { $_.RowKey })
+                    # The MCP reconcile below rewrites redirects and consent, which would break the SSO/SAM app if one was saved as a client
+                    $ProtectedAppIds = Get-CippProtectedAppId
+                    $McpClientIds = @($EnabledClients | Where-Object { "$($_.MCPAllowed)" -eq 'True' -and $_.RowKey -notin $ProtectedAppIds } | ForEach-Object { $_.RowKey })
 
                     $ApiAuthConfig = $env:WEBSITE_AUTH_V2_CONFIG_JSON | ConvertFrom-Json -ErrorAction Stop
                     $AADConfig = $ApiAuthConfig.identityProviders.azureActiveDirectory
@@ -257,7 +259,8 @@ function Initialize-CIPPAuth {
                     $McpResourceObjectId = $null
                     $McpResourceScopeId = $null
                     try {
-                        $McpResRow = Get-CIPPAzDataTableEntity @(Get-CippTable -tablename 'CippMcpResource') -Filter "PartitionKey eq 'McpResource' and RowKey eq 'McpResource'"
+                        $McpResTable = Get-CippTable -tablename 'CippMcpResource'
+                        $McpResRow = Get-CIPPAzDataTableEntity @McpResTable -Filter "PartitionKey eq 'McpResource' and RowKey eq 'McpResource'"
                         if (-not [string]::IsNullOrWhiteSpace($McpResRow.ObjectId)) { $McpResourceObjectId = "$($McpResRow.ObjectId)" }
                         if (-not [string]::IsNullOrWhiteSpace($McpResRow.ScopeId)) { $McpResourceScopeId = "$($McpResRow.ScopeId)" }
                     } catch {

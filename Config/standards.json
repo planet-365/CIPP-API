@@ -1675,6 +1675,22 @@
     "recommendedBy": ["CIS", "CIPP"]
   },
   {
+    "name": "standards.DisableAgentBlueprintCreation",
+    "cat": "Entra (AAD) Standards",
+    "tag": [],
+    "appliesToTest": [],
+    "helpText": "Disables the ability for users to register agent identity blueprints in the tenant. This is a separate setting from 'Users can register applications'; disabling app registrations does not stop users from creating agent identity blueprints.",
+    "docsDescription": "Sets the Entra default user role permission 'Users can register agent identity blueprints' to No. Microsoft enables this for all users by default, and the creator of a blueprint becomes its owner and can manage its credentials. This setting is independent of 'Users can register applications', so apply both standards to keep application and agent identity creation limited to the Agent ID Developer and Agent ID Administrator roles.",
+    "executiveText": "Prevents regular employees from creating AI agent identity blueprints, which are the templates that agent identities are issued from. Restricting this to designated roles keeps agent identities and their credentials under IT governance and avoids a sprawl of unmanaged agent registrations.",
+    "addedComponent": [],
+    "label": "Disable agent identity blueprint creation by users",
+    "impact": "Low Impact",
+    "impactColour": "info",
+    "addedDate": "2026-10-15",
+    "powershellEquivalent": "Update-MgBetaPolicyAuthorizationPolicy",
+    "recommendedBy": ["CIPP"]
+  },
+  {
     "name": "standards.BitLockerKeysForOwnedDevice",
     "cat": "Entra (AAD) Standards",
     "tag": ["CIS M365 7.0.0 (5.1.4.6)"],
@@ -4810,7 +4826,7 @@
     "name": "standards.intuneDeviceRetirementDays",
     "cat": "Intune Standards",
     "tag": [],
-    "helpText": "A value between 31 and 365 is supported. retired devices are removed from Intune after the specified number of days.",
+    "helpText": "A value between 30 and 270 is supported, matching what Intune accepts. Retired devices are removed from Intune after the specified number of days.",
     "executiveText": "Automatically removes inactive devices from management after a specified period, helping maintain a clean device inventory and reducing security risks from abandoned or lost devices. This policy ensures that only actively used corporate devices remain in the management system.",
     "addedComponent": [
       {
@@ -5679,8 +5695,8 @@
         "label": "Days until expiration (Default 60)",
         "defaultValue": 60,
         "validators": {
-          "min": { "value": 1, "message": "Minimum value is 1" },
-          "max": { "value": 730, "message": "Maximum value is 730" }
+          "min": { "value": 30, "message": "SharePoint accepts 30 to 730 days - lower values are silently ignored" },
+          "max": { "value": 730, "message": "SharePoint accepts 30 to 730 days" }
         }
       }
     ],
@@ -6229,8 +6245,8 @@
     "name": "standards.PlannerBlockTaskDelete",
     "cat": "Teams Standards",
     "tag": [],
-    "helpText": "Sets the Planner user policy that blocks each in-scope member from deleting Planner tasks they did not create. Applies across all basic Planner plans for that user (not a single board). Only enabled members with an enabled Microsoft Planner (PROJECTWORKMANAGEMENT) service plan are touched. Optionally limit the sweep to members of named groups or skip members of named groups. The remediate wash is limited to once per 24 hours per tenant because there is no list API and every user needs its own write. Alert and report still run every time. May also prevent those users from deleting plans. Requires CIPP-SAM consent for ProjectWorkManagement OrgSettings-Planner permissions.",
-    "docsDescription": "Uses the Planner tenant admin UserPolicy API (tasks.office.com) to set blockDeleteTasksNotCreatedBySelf to true for each in-scope enabled member account that has an enabled PROJECTWORKMANAGEMENT (Microsoft Planner) service plan in the user cache. Guest accounts, disabled accounts, and members without that plan are ignored. Group names are resolved per tenant by display name and expanded to their transitive user members: include groups restrict the sweep to those members, exclude groups remove them from it. A configured group that does not exist in a tenant, or a failed membership lookup, skips the run rather than sweeping the wrong accounts. When no include group is named, every Planner-licensed enabled member account is in scope. Remediate is an idempotent PUT per candidate with no preflight GET; a 24-hour rerun guard (Test-CIPPRerun) skips repeating that write sweep for the same settings, while alert and report still GET live state each run. The policy is per user and applies to all basic plans that user can access; it is not board-scoped. Known side effect: the same policy can also block plan deletion. Requires application permissions OrgSettings-Planner.ReadWrite.All on ProjectWorkManagement (tasks.office.com), consented via CIPP-SAM repair and CPV refresh.",
+    "helpText": "Stops users from deleting Planner tasks that someone else created. Applies to all of a user's plans, and may also stop them from deleting plans. Use the group fields to limit who it applies to.",
+    "docsDescription": "Sets Planner's per-user policy that blocks deleting tasks created by someone else. The policy covers every plan the user can access (not a single board) and can also block deleting plans. Only enabled member accounts with a Planner license are changed; guests and disabled accounts are skipped. Use include groups to apply it to specific people only, and exclude groups to leave people out. If a named group can't be found, the run is skipped. Because each user is set one at a time, remediation runs at most once a day per tenant; alerts and reports check every run.",
     "executiveText": "Stops employees from deleting Planner tasks they did not create, reducing accidental loss on boards used as shared work queues. Can be limited to a department security group so only those staff are locked down.",
     "addedComponent": [
       {
@@ -6239,7 +6255,7 @@
         "creatable": true,
         "required": false,
         "name": "standards.PlannerBlockTaskDelete.includeGroups",
-        "label": "Only apply to members of these groups (display names; blank = all Planner-licensed enabled members)"
+        "label": "Only apply to members of these groups (leave blank for all users)"
       },
       {
         "type": "autoComplete",
@@ -6655,6 +6671,19 @@
         "name": "standards.TeamsMessagingPolicy.AllowCommunicationComplianceEndUserReporting",
         "label": "Allow reporting message as inappropriate content",
         "defaultValue": true
+      },
+      {
+        "type": "autoComplete",
+        "multiple": false,
+        "creatable": false,
+        "name": "standards.TeamsMessagingPolicy.AutoShareFilesInExternalChats",
+        "label": "Automatically share files attached in external chats",
+        "options": [
+          { "label": "Don't change", "value": "donotconfigure" },
+          { "label": "Enabled", "value": "Enabled" },
+          { "label": "Disabled", "value": "Disabled" }
+        ],
+        "defaultValue": "donotconfigure"
       }
     ],
     "label": "Global Messaging Policy for Microsoft Teams",
@@ -6663,6 +6692,62 @@
     "addedDate": "2025-01-10",
     "powershellEquivalent": "Set-CsTeamsMessagingPolicy",
     "recommendedBy": [],
+    "requiredCapabilities": ["MCOSTANDARD", "MCOEV", "MCOIMP", "TEAMS1", "Teams_Room_Standard"]
+  },
+  {
+    "name": "standards.TeamsFilesPolicy",
+    "cat": "Teams Standards",
+    "tag": [],
+    "helpText": "Sets the properties of the Global Teams files policy, including file sharing in external (federated) chats.",
+    "docsDescription": "Sets the properties of the Global Teams files policy. File sharing in external chats controls whether users can attach files in 1:1, group and meeting chats with people from other organizations. Native file entry points controls the OneDrive and SharePoint attach options in chats and channels, and SharePoint channel files tab controls the SharePoint Files tab in channels.",
+    "executiveText": "Controls whether employees can attach files directly in Microsoft Teams chats with people outside the organization. Microsoft is enabling this by default for all tenants, including those that had turned it off, so managing it as a standard keeps the organization's chosen external sharing posture in place.",
+    "addedComponent": [
+      {
+        "type": "autoComplete",
+        "multiple": false,
+        "creatable": false,
+        "name": "standards.TeamsFilesPolicy.FileSharingInChatsWithExternalUsers",
+        "label": "File sharing in external chats",
+        "options": [
+          { "label": "Don't change", "value": "donotconfigure" },
+          { "label": "Enabled", "value": "Enabled" },
+          { "label": "Disabled", "value": "Disabled" }
+        ],
+        "defaultValue": "Disabled"
+      },
+      {
+        "type": "autoComplete",
+        "multiple": false,
+        "creatable": false,
+        "name": "standards.TeamsFilesPolicy.NativeFileEntryPoints",
+        "label": "OneDrive and SharePoint file entry points",
+        "options": [
+          { "label": "Don't change", "value": "donotconfigure" },
+          { "label": "Enabled", "value": "Enabled" },
+          { "label": "Disabled", "value": "Disabled" }
+        ],
+        "defaultValue": "donotconfigure"
+      },
+      {
+        "type": "autoComplete",
+        "multiple": false,
+        "creatable": false,
+        "name": "standards.TeamsFilesPolicy.SPChannelFilesTab",
+        "label": "SharePoint channel files tab",
+        "options": [
+          { "label": "Don't change", "value": "donotconfigure" },
+          { "label": "Enabled", "value": "Enabled" },
+          { "label": "Disabled", "value": "Disabled" }
+        ],
+        "defaultValue": "donotconfigure"
+      }
+    ],
+    "label": "Global Files Policy for Microsoft Teams",
+    "impact": "Low Impact",
+    "impactColour": "info",
+    "addedDate": "2026-09-28",
+    "powershellEquivalent": "Set-CsTeamsFilesPolicy -Identity Global -FileSharingInChatsWithExternalUsers Disabled",
+    "recommendedBy": ["CIPP"],
     "requiredCapabilities": ["MCOSTANDARD", "MCOEV", "MCOIMP", "TEAMS1", "Teams_Room_Standard"]
   },
   {
@@ -6781,16 +6866,36 @@
         "defaultValue": true
       },
       {
-        "type": "switch",
-        "name": "standards.AutopilotProfile.AssignToAllDevices",
-        "label": "Assign to all devices",
-        "defaultValue": true
+        "type": "radio",
+        "name": "standards.AutopilotProfile.AssignTo",
+        "label": "Assign the profile to",
+        "options": [
+          { "label": "Do not assign", "value": "none" },
+          { "label": "All devices", "value": "allDevices" },
+          { "label": "Custom group(s)", "value": "customGroup" }
+        ],
+        "defaultValue": "allDevices"
+      },
+      {
+        "type": "textField",
+        "required": false,
+        "name": "standards.AutopilotProfile.customGroup",
+        "label": "Group name(s) to assign",
+        "helpText": "Used when 'Custom group(s)' is selected. Wildcards are allowed. Multiple group names are comma-separated."
+      },
+      {
+        "type": "textField",
+        "required": false,
+        "name": "standards.AutopilotProfile.excludeGroup",
+        "label": "Exclude group(s)",
+        "helpText": "Group name(s) to exclude from the assignment. Wildcards are allowed. Multiple group names are comma-separated."
       },
       {
         "type": "switch",
         "name": "standards.AutopilotProfile.SelfDeployingMode",
         "label": "Enable Self-deploying Mode",
-        "defaultValue": true
+        "defaultValue": true,
+        "helperText": "Self-deploying (shared) profiles cannot use White Glove / pre-provisioned deployment, so pre-provisioning is always off while this is enabled."
       },
       {
         "type": "switch",
@@ -6820,7 +6925,13 @@
         "type": "switch",
         "name": "standards.AutopilotProfile.AllowWhiteGlove",
         "label": "Allow White Glove OOBE",
-        "defaultValue": true
+        "defaultValue": true,
+        "helperText": "Only available for user-driven profiles. Self-deploying mode always sets this to off.",
+        "condition": {
+          "field": "standards.AutopilotProfile.SelfDeployingMode",
+          "compareType": "isNot",
+          "compareValue": true
+        }
       },
       {
         "type": "switch",
@@ -8028,13 +8139,13 @@
       {
         "type": "switch",
         "name": "standards.DefenderCompliancePolicy.ConnectMac",
-        "label": "Connect macOS devices to MDE",
+        "label": "Connect macOS devices to MDE (Note: enabling this forces 'Block macOS if partner data unavailable' to on)",
         "defaultValue": false
       },
       {
         "type": "switch",
         "name": "standards.DefenderCompliancePolicy.macDeviceBlockedOnMissingPartnerData",
-        "label": "Block macOS if partner data unavailable",
+        "label": "Block macOS if partner data unavailable (Note: Microsoft enforces this to on when Connect macOS devices to MDE is on)",
         "defaultValue": false
       },
       {
@@ -8591,7 +8702,7 @@
     "impact": "Low Impact",
     "impactColour": "info",
     "addedDate": "2026-05-06",
-    "powershellEquivalent": "Set-TeamsProtectionPolicy -Identity 'Teams Protection Policy' -ZapEnabled $true",
+    "powershellEquivalent": "Set-TeamsProtectionPolicy -Identity 'Default Teams Protection Policy' -ZapEnabled $true",
     "recommendedBy": ["CIS"],
     "requiredCapabilities": [
       "EXCHANGE_S_STANDARD",
