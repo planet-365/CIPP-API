@@ -1,0 +1,139 @@
+function Invoke-ListIntuneScript {
+    <#
+    .FUNCTIONALITY
+        Entrypoint
+    .ROLE
+        Endpoint.MEM.Read
+    .DESCRIPTION
+        Lists Intune device management scripts (Windows, macOS, Linux, and remediation scripts) for a tenant. Supports UseReportDB=true query parameter to retrieve cached data from the reporting database for significantly better performance, especially when querying AllTenants.
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $TenantFilter = $Request.Query.tenantFilter
+    # Serve from the reporting database cache instead of live Graph. Much faster, especially for AllTenants.
+    $UseReportDB = $Request.Query.UseReportDB -eq $true
+    $Results = [System.Collections.Generic.List[System.Object]]::new()
+
+    $BulkRequests = @(
+        @{
+            id     = 'Groups'
+            method = 'GET'
+            url    = '/groups?$top=999&$select=id,displayName'
+        }
+        @{
+            id     = 'Windows'
+            method = 'GET'
+            url    = '/deviceManagement/deviceManagementScripts?$expand=assignments'
+        }
+        @{
+            id     = 'MacOS'
+            method = 'GET'
+            url    = '/deviceManagement/deviceShellScripts?$expand=assignments'
+        }
+        @{
+            id     = 'Remediation'
+            method = 'GET'
+            url    = '/deviceManagement/deviceHealthScripts?$expand=assignments'
+        }
+        @{
+            id     = 'Linux'
+            method = 'GET'
+            url    = '/deviceManagement/configurationPolicies?$expand=assignments'
+        }
+    )
+
+    try {
+        if ($TenantFilter -eq 'AllTenants' -or $UseReportDB) {
+            try {
+                # Return one page per request as { Results, Metadata } with a continuation token in Metadata.nextLink.
+                if ($Request.Query.manualPagination -eq $true) {
+                    # Cached rows per page, clamped between 250 and 10000. Defaults to 5000. Pages hold whole tenants.
+                    $PageSize = $Request.Query.PageSize -as [int]
+                    return ([HttpResponseContext]@{
+                            StatusCode = [HttpStatusCode]::OK
+                            # Continuation token from the previous page's Metadata.nextLink; opaque to callers.
+                            Body       = Get-CIPPReportPage -TenantFilter $TenantFilter -Type 'IntuneWindowsScripts', 'IntuneMacOSScripts', 'IntuneRemediationScripts', 'IntuneLinuxScripts' -PageSize $PageSize -ContinuationToken $Request.Query.nextLink -Report { param($Tenant) Get-CIPPIntuneScriptReport -TenantFilter $Tenant -ErrorAction Stop }
+                        })
+                }
+                $Results = Get-CIPPIntuneScriptReport -TenantFilter $TenantFilter -ErrorAction Stop
+                $StatusCode = [HttpStatusCode]::OK
+            } catch {
+                $StatusCode = [HttpStatusCode]::InternalServerError
+                $Results = $_.Exception.Message
+            }
+            return ([HttpResponseContext]@{
+                    StatusCode = $StatusCode
+                    Body       = @($Results)
+                })
+        }
+
+        $BulkResults = New-GraphBulkRequest -Requests $BulkRequests -tenantid $TenantFilter
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-Host "Failed to retrieve scripts. Error: $($ErrorMessage.NormalizedError)"
+    }
+
+    # Extract groups for resolving assignment names
+    $Groups = ($BulkResults | Where-Object { $_.id -eq 'Groups' }).body.value
+
+    foreach ($scriptId in @('Windows', 'MacOS', 'Remediation', 'Linux')) {
+        $BulkResult = ($BulkResults | Where-Object { $_.id -eq $scriptId })
+        if ($BulkResult.status -ne 200) {
+            $Results.Add(@{
+                    'scriptType'  = $scriptId
+                    'displayName' = if (Test-Json $BulkResult.body.error.message) {
+                        ($BulkResult.body.error.message | ConvertFrom-Json).Message
+                    } else {
+                        $BulkResult.body.error.message
+                    }
+                })
+            continue
+        }
+        $scripts = $BulkResult.body.value
+
+        if ($scriptId -eq 'Linux') {
+            $scripts = $scripts | Where-Object { $_.platforms -eq 'linux' -and $_.templateReference.templateFamily -eq 'deviceConfigurationScripts' }
+            $scripts | ForEach-Object { $_ | Add-Member -MemberType NoteProperty -Name displayName -Value $_.name -Force }
+        }
+
+        # Process assignments for each script
+        foreach ($script in $scripts) {
+            $ScriptAssignment = [System.Collections.Generic.List[string]]::new()
+            $ScriptExclude = [System.Collections.Generic.List[string]]::new()
+
+            if ($script.assignments) {
+                foreach ($Assignment in $script.assignments) {
+                    $target = $Assignment.target
+                    switch ($target.'@odata.type') {
+                        '#microsoft.graph.allDevicesAssignmentTarget' { $ScriptAssignment.Add('All Devices') }
+                        '#microsoft.graph.allLicensedUsersAssignmentTarget' { $ScriptAssignment.Add('All Licensed Users') }
+                        '#microsoft.graph.groupAssignmentTarget' {
+                            $groupName = ($Groups | Where-Object { $_.id -eq $target.groupId }).displayName
+                            if ($groupName) { $ScriptAssignment.Add($groupName) }
+                        }
+                        '#microsoft.graph.exclusionGroupAssignmentTarget' {
+                            $groupName = ($Groups | Where-Object { $_.id -eq $target.groupId }).displayName
+                            if ($groupName) { $ScriptExclude.Add($groupName) }
+                        }
+                    }
+                }
+            }
+
+            $script | Add-Member -NotePropertyMembers ([ordered]@{
+                    ScriptAssignment = ($ScriptAssignment -join ', ')
+                    ScriptExclude    = ($ScriptExclude -join ', ')
+                }) -Force
+        }
+
+        $scripts | Add-Member -MemberType NoteProperty -Name scriptType -Value $scriptId
+        Write-Host "$scriptId scripts count: $($scripts.Count)"
+        $Results.AddRange(@($scripts))
+    }
+
+    return ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]::OK
+            Body       = @($Results)
+        })
+
+}

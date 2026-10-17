@@ -1,0 +1,121 @@
+function Invoke-CippTestZTNA21992 {
+    <#
+    .SYNOPSIS
+    Application certificates must be rotated on a regular basis
+    #>
+    param($Tenant)
+
+    try {
+        $Apps = Get-CIPPTestData -TenantFilter $Tenant -Type 'Apps'
+        $ServicePrincipals = Get-CIPPTestData -TenantFilter $Tenant -Type 'ServicePrincipals'
+        #Tested
+        if (-not $Apps -and -not $ServicePrincipals) {
+            Add-CippTestResult -TenantFilter $Tenant -TestId 'ZTNA21992' -TestType 'Identity' -Status 'Skipped' -ResultMarkdown 'No data found in database. This may be due to missing required licenses or data collection not yet completed.' -Risk 'High' -Name 'Application certificates must be rotated on a regular basis' -UserImpact 'Low' -ImplementationEffort 'High' -Category 'Application management'
+            return
+        }
+
+        $RotationThresholdDays = 180
+        $ThresholdDate = (Get-Date).AddDays(-$RotationThresholdDays)
+
+        $OldAppCerts = @()
+        if ($Apps) {
+            $OldAppCerts = $Apps.Where({
+                $_.keyCredentials -and $_.keyCredentials.Count -gt 0
+            }) | ForEach-Object {
+                $App = $_
+                $OldestCert = $null
+                foreach ($Credential in $App.keyCredentials) {
+                    if ($Credential.startDateTime) {
+                        $Started = [DateTime]$Credential.startDateTime
+                        if ($null -eq $OldestCert -or $Started -lt $OldestCert) { $OldestCert = $Started }
+                    }
+                }
+
+                if ($OldestCert -and $OldestCert -lt $ThresholdDate) {
+                    [PSCustomObject]@{
+                        Type           = 'Application'
+                        DisplayName    = $App.displayName
+                        AppId          = $App.appId
+                        Id             = $App.id
+                        OldestCertDate = $OldestCert
+                    }
+                }
+            }
+        }
+
+        $OldSPCerts = @()
+        if ($ServicePrincipals) {
+            $OldSPCerts = $ServicePrincipals.Where({
+                $_.keyCredentials -and $_.keyCredentials.Count -gt 0
+            }) | ForEach-Object {
+                $SP = $_
+                $OldestCert = $null
+                foreach ($Credential in $SP.keyCredentials) {
+                    if ($Credential.startDateTime) {
+                        $Started = [DateTime]$Credential.startDateTime
+                        if ($null -eq $OldestCert -or $Started -lt $OldestCert) { $OldestCert = $Started }
+                    }
+                }
+
+                if ($OldestCert -and $OldestCert -lt $ThresholdDate) {
+                    [PSCustomObject]@{
+                        Type           = 'ServicePrincipal'
+                        DisplayName    = $SP.displayName
+                        AppId          = $SP.appId
+                        Id             = $SP.id
+                        OldestCertDate = $OldestCert
+                    }
+                }
+            }
+        }
+
+        if ($OldAppCerts.Count -eq 0 -and $OldSPCerts.Count -eq 0) {
+            Add-CippTestResult -TenantFilter $Tenant -TestId 'ZTNA21992' -TestType 'Identity' -Status 'Passed' -ResultMarkdown "Certificates for applications in your tenant have been issued within $RotationThresholdDays days" -Risk 'High' -Name 'Application certificates must be rotated on a regular basis' -UserImpact 'Low' -ImplementationEffort 'High' -Category 'Application management'
+            return
+        }
+
+        $Status = 'Failed'
+
+        $ResultLines = [System.Collections.Generic.List[string]]::new()
+        $ResultLines.Add("Found $($OldAppCerts.Count) application(s) and $($OldSPCerts.Count) service principal(s) with certificates not rotated within $RotationThresholdDays days.")
+        $ResultLines.Add('')
+        $ResultLines.Add("**Certificate rotation threshold:** $RotationThresholdDays days")
+        $ResultLines.Add('')
+
+        if ($OldAppCerts.Count -gt 0) {
+            $ResultLines.Add('**Applications with old certificates:**')
+            $Top10Apps = $OldAppCerts.Where({ $true }, 'First', 10)
+            foreach ($App in $Top10Apps) {
+                $DaysOld = [Math]::Round(((Get-Date) - $App.OldestCertDate).TotalDays, 0)
+                $ResultLines.Add("- $($App.DisplayName) (Certificate age: $DaysOld days)")
+            }
+            if ($OldAppCerts.Count -gt 10) {
+                $ResultLines.Add("- ... and $($OldAppCerts.Count - 10) more application(s)")
+            }
+            $ResultLines.Add('')
+        }
+
+        if ($OldSPCerts.Count -gt 0) {
+            $ResultLines.Add('**Service principals with old certificates:**')
+            $Top10SPs = $OldSPCerts.Where({ $true }, 'First', 10)
+            foreach ($SP in $Top10SPs) {
+                $DaysOld = [Math]::Round(((Get-Date) - $SP.OldestCertDate).TotalDays, 0)
+                $ResultLines.Add("- $($SP.DisplayName) (Certificate age: $DaysOld days)")
+            }
+            if ($OldSPCerts.Count -gt 10) {
+                $ResultLines.Add("- ... and $($OldSPCerts.Count - 10) more service principal(s)")
+            }
+            $ResultLines.Add('')
+        }
+
+        $ResultLines.Add('**Recommendation:** Rotate certificates regularly to reduce the risk of credential compromise.')
+
+        $Result = $ResultLines -join "`n"
+
+        Add-CippTestResult -TenantFilter $Tenant -TestId 'ZTNA21992' -TestType 'Identity' -Status $Status -ResultMarkdown $Result -Risk 'High' -Name 'Application certificates must be rotated on a regular basis' -UserImpact 'Low' -ImplementationEffort 'High' -Category 'Application management'
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -API 'Tests' -tenant $Tenant -message "Failed to run test: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+        Add-CippTestResult -TenantFilter $Tenant -TestId 'ZTNA21992' -TestType 'Identity' -Status 'Failed' -ResultMarkdown "Test failed: $($ErrorMessage.NormalizedError)" -Risk 'High' -Name 'Application certificates must be rotated on a regular basis' -UserImpact 'Low' -ImplementationEffort 'High' -Category 'Application management'
+    }
+}
